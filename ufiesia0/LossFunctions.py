@@ -1,5 +1,5 @@
 # LossFunctions
-# 2022.05.20 井上
+# 2025.08.15 井上
 from ufiesia0.Config import *
 print(np.__name__, 'is running in', __file__, np.random.rand(1))    
 
@@ -28,7 +28,7 @@ class CrossEntropyError:
     def backward(self, gl=1):
         y = self.y
         t = self.t
-        gy = - gl * t / (y + 1e-7)
+        gy =  (- gl) * (t / (y + 1e-7)) # ()が無いと精度が変ってしまう
         return gy / self.k
 
 class CrossEntropyError2():
@@ -36,7 +36,7 @@ class CrossEntropyError2():
         self.y = y
         self.t = t
         self.k = y.size // y.shape[-1]  # 時系列データで必須
-        l = -np.sum(t*np.log(y+1e-7)+(1-t)*np.log(1-y+1e-7))
+        l = - np.sum(t*np.log(y+1e-7)+(1-t)*np.log(1-y+1e-7))
         return l / self.k
 
     def backward(self, gl=1):
