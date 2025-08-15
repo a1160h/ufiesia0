@@ -1,6 +1,6 @@
 # Optimizer
 # 最適化関数
-# 2022.09.14 A.Inoue
+# 2025.08.15 A.Inoue
 
 from ufiesia0.Config import *
 
@@ -82,7 +82,7 @@ class Adam(OptimizerBase):
         if self.vlcty is None:
             self.vlcty = np.zeros_like(gradient)
         if self.hstry is None:
-            self.hstry = np.ones_like(gradient)
+            self.hstry = np.zeros_like(gradient)
          
         self.vlcty -= (1 - self.momentum)  * (self.vlcty - gradient)
         self.hstry -= (1 - self.decayrate) * (self.hstry - gradient ** 2)
