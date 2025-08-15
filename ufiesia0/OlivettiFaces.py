@@ -1,5 +1,5 @@
 # OlivettiFaces
-# 2022.05.20 井上
+# 2025.08.15 井上
 
 from ufiesia0.Config import *
 print(np.__name__, 'is running in', __file__, np.random.rand(1))    
@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 def get_data():
     data = datasets.fetch_olivetti_faces().data
     target = datasets.fetch_olivetti_faces().target
-    data = np.array(data.tolist())
-    correct = np.eye(40)[target]
+    data = np.array(data.tolist(), dtype=Config.dtype)
+    correct = np.eye(40, dtype=bool)[target]
     target = np.array(target.tolist())     
     return data, correct, target
 
