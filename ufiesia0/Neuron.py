@@ -74,8 +74,101 @@ class NeuronLayer(BaseLayer):
         return grad_x.reshape(x_shape)
 
 ### 畳み込み層 #####################################################
+class PremitiveConvLayer(BaseLayer):
+    """ 畳み込み層(動作原理に忠実な基本版) """
+    # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
+    # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
+    # Sh:ストライド高，Sw:ストライド幅, pad:パディング幅
+    # 出力チャンネル数=フィルタ数M, Oh:出力高, Ow:出力幅
+    def __init__(self, *configuration, **kwargs):
+        if len(configuration) == 6:
+            C, image_size, M, kernel_size, stride, pad = configuration
+        elif len(configuration) == 4:
+            C = None; image_size = None
+            M, kernel_size, stride, pad = configuration
+        elif len(configuration) == 2:
+            C = None; image_size = None
+            M, kernel_size = configuration
+            stride = 1; pad = 0 
+        else:
+            raise Exception('cannot initialize ' + self.__class__.__name__)   
+        Oh = None; Ow = None
+
+        Ih, Iw = image_size if isinstance(image_size, (tuple, list)) \
+                            else (image_size, image_size)
+        Fh, Fw = kernel_size if isinstance(kernel_size, (tuple, list)) \
+                             else (kernel_size, kernel_size)
+        Sh, Sw = stride if isinstance(stride, (tuple, list)) \
+                        else (stride, stride)
+        
+        self.config = C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow
+        self.grad_w, self.grad_b = None, None
+        super().__init__(**kwargs)
+
+    def fix_configuration(self, shape):
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        if (C is None or Ih is None or Iw is None) and len(shape) >= 3:
+            Ih = shape[-2] 
+            Iw = shape[-1] 
+            C = shape[1] if len(shape)==4 else 1
+        elif C is None or Ih is None or Iw is None:
+            raise Exception(self.__class__.__name__ + ' cannot fix configuration.')
+            
+        Oh = (Ih - Fh + 2*pad) // Sh + 1   # 出力高さ
+        Ow = (Iw - Fw + 2*pad) // Sw + 1   # 出力幅
+        self.config = C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow
+        
+    def forward(self, x):
+        if None in self.config:
+            self.fix_configuration(x.shape)
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        if self.w is None:
+            self.init_parameter(C*Fh*Fw, M)
+          
+        B = x.size // (C*Ih*Iw) # B = x.shape[0] = len(x)
+        # 画像調整  (C,Ih*Iw)にも対応            B     C     Ih上Ih下  Iw左Iw右　ゼロパディング   
+        self.x = np.pad(x.reshape(B,C,Ih,Iw), [(0,0),(0,0),(pad,pad),(pad,pad)], 'constant')
+        
+        u = np.zeros((B,Oh,Ow,M), dtype=Config.dtype)
+        for ih in range(0, Ih-Fh+2*pad+1, Sh):       # ih+FhがIhからはみ出さないように
+            for iw in range(0, Iw-Fw+2*pad+1, Sw):   # iw+FwがIwからはみ出さないように 
+                xij = self.x[:,:,ih:ih+Fh, iw:iw+Fw] # xのFh*Fwの領域を取出す
+                xij = xij.reshape(B, -1)
+                uij = np.dot(xij, self.w) + self.b   # 取出した領域を共通のwとbでaffine変換
+                u[:,ih//Sh,iw//Sw,:] = uij           # uの該当箇所に値を設定
+        u = u.transpose(0,3,1,2)
+        y = self.activator.forward(u)                      
+        return y
+    
+    def backward(self, grad_y):
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        B = grad_y.size // (M*Oh*Ow)
+        self.grad_y = grad_y.reshape(B, M, Oh, Ow)
+        delta = self.activator.backward(self.grad_y)       
+        delta = delta.transpose(0,2,3,1) 
+
+        gx = np.zeros_like(self.x, dtype=Config.dtype)
+        self.grad_w = np.zeros_like(self.w, dtype=Config.dtype)
+        self.grad_b = np.zeros_like(self.b, dtype=Config.dtype)
+
+        for ih in range(0, Ih-Fh+2*pad+1, Sh):
+            for iw in range(0, Iw-Fw+2*pad+1, Sw):
+                xij = self.x[:,:,ih:ih+Fh, iw:iw+Fw]
+                xij = xij.reshape(B, -1)
+                guij = delta[:,ih//Sh,iw//Sw,:]
+                gwij = np.dot(xij.T, guij)
+                gbij = np.sum(guij, axis=0)
+                gxij = np.dot(guij, self.w.T)
+                gx[:,:,ih:ih+Fh, iw:iw+Fw] = gxij.reshape(B,C,Fh,Fw)
+                self.grad_w += gwij
+                self.grad_b += gbij
+         
+        # 順伝播で画像調整した分を戻す
+        gx = gx[:, :, pad:pad+Ih, pad:pad+Iw]
+        return gx
+
 class ConvLayer(BaseLayer):
-    """ 畳み込み層 """
+    """ 畳み込み層(img2col変換による高速版 numpyではあまり差がないがcupyで顕著) """
     # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
     # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
     # Sh:ストライド高，Sw:ストライド幅, pad:パディング幅
@@ -265,7 +358,9 @@ class PoolingLayer:
                               #     (B,C, Ih+pad+pdh,Iw+pad+pdw) 
 
         # 順伝播で画像調整した分を戻す
-        grad_x = np.pad(grad_x, [(0,0),(0,0),(0,Ih-Oh*pool_h),(0,Iw-Ow*pool_w)], 'constant')
+        trancated_h = Ih + 2*pad - Oh*pool_h
+        trancated_w = Iw + 2*pad - Ow*pool_w
+        grad_x = np.pad(grad_x, [(0,0),(0,0),(0,trancated_h),(0,trancated_w)], 'constant')
         grad_x = grad_x[:, :, pad:pad+Ih, pad:pad+Iw]  # grad_x.shape=(B,C,Ih,Iw) 
         return grad_x
 
