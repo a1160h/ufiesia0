@@ -159,7 +159,7 @@ class PremitiveConvLayer(BaseLayer):
                 gwij = np.dot(xij.T, guij)
                 gbij = np.sum(guij, axis=0)
                 gxij = np.dot(guij, self.w.T)
-                gx[:,:,ih:ih+Fh, iw:iw+Fw] = gxij.reshape(B,C,Fh,Fw)
+                gx[:,:,ih:ih+Fh, iw:iw+Fw] += gxij.reshape(B,C,Fh,Fw)
                 self.grad_w += gwij
                 self.grad_b += gbij
          
