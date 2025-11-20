@@ -74,7 +74,7 @@ class NeuronLayer(BaseLayer):
         return grad_x.reshape(x_shape)
 
 ### 畳み込み層 #####################################################
-class PremitiveConvLayer(BaseLayer):
+class PrimitiveConvLayer(BaseLayer):
     """ 畳み込み層(動作原理に忠実な基本版) """
     # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
     # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
