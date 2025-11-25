@@ -74,7 +74,7 @@ class NeuronLayer(BaseLayer):
         return grad_x.reshape(x_shape)
 
 ### 畳み込み層 #####################################################
-class PrimitiveConvLayer(BaseLayer):
+class PremitiveConvLayer(BaseLayer):
     """ 畳み込み層(動作原理に忠実な基本版) """
     # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
     # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
@@ -168,6 +168,153 @@ class PrimitiveConvLayer(BaseLayer):
         return gx
 
 class ConvLayer(BaseLayer):
+    """ 畳み込み層(img2col変換による高速版 numpyではあまり差がないがcupyで顕著) """
+    # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
+    # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
+    # Sh:ストライド高，Sw:ストライド幅, pad:パディング幅
+    # 出力チャンネル数=フィルタ数M, Oh:出力高, Ow:出力幅
+    def __init__(self, *configuration, **kwargs):
+        if len(configuration) == 6:
+            C, image_size, M, kernel_size, stride, pad = configuration
+        elif len(configuration) == 4:
+            C = None; image_size = None; M, kernel_size, stride, pad = configuration
+        elif len(configuration) == 2:
+            C = None; image_size = None; M, kernel_size = configuration; stride = 1; pad = 0 
+        else:
+            raise Exception('cannot initialize ' + self.__class__.__name__)   
+        Oh = None; Ow = None
+
+        Ih, Iw = image_size if isinstance(image_size, (tuple, list)) else (image_size, image_size)
+        Fh, Fw = kernel_size if isinstance(kernel_size, (tuple, list)) else (kernel_size, kernel_size)
+        Sh, Sw = stride if isinstance(stride, (tuple, list)) else (stride, stride)
+        
+        self.config = C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow
+        super().__init__(**kwargs)
+
+    def fix_configuration(self, shape):
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        if (C is None or Ih is None or Iw is None) and len(shape) >= 3:
+            Ih = shape[-2] 
+            Iw = shape[-1] 
+            C = shape[1] if len(shape)==4 else 1
+        elif C is None or Ih is None or Iw is None:
+            raise Exception(self.__class__.__name__ + ' cannot fix configuration.')
+            
+        Oh = (Ih - Fh + 2*pad) // Sh + 1   # 出力高さ
+        Ow = (Iw - Fw + 2*pad) // Sw + 1   # 出力幅
+        self.config = C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow
+        
+    def forward(self, x):
+        if None in self.config:
+            self.fix_configuration(x.shape)
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        if self.w is None:
+            self.init_parameter(C*Fh*Fw, M)
+          
+        B = x.size // (C*Ih*Iw) # B = x.shape[0] = len(x)
+        # 画像調整  (C,Ih*Iw)にも対応            B      C      Ih上 Ih下   Iw左 Iw右　 ゼロパディング   
+        img_pad = np.pad(x.reshape(B,C,Ih,Iw), [(0,0), (0,0), (pad, pad), (pad, pad)], 'constant')
+        self.cols = PrimitiveIm2col(C, Ih+2*pad, Iw+2*pad, Fh, Fw, Sh, Sw, Oh, Ow)(img_pad)   
+        # 出力の計算: 行列積、バイアスの加算、活性化関数
+        u = np.dot(self.cols, self.w) +self.b
+        u = u.reshape(B, Oh, Ow, M).transpose(0, 3, 1, 2)
+        y = self.activator.forward(u)                 
+        return y
+    
+    def backward(self, grad_y):
+        C, Ih, Iw, M, Fh, Fw, Sh, Sw, pad, Oh, Ow = self.config
+        B = grad_y.size // (M*Oh*Ow)
+        self.grad_y = grad_y.reshape(B, M, Oh, Ow)
+        delta = self.activator.backward(self.grad_y)       
+        delta = delta.transpose(0, 2, 3, 1).reshape(B*Oh*Ow, M)
+
+        # フィルタとバイアスの勾配                   
+        self.grad_w = np.dot(self.cols.T, delta)
+        self.grad_b = np.sum(delta, axis=0)
+        grad_cols = np.dot(delta, self.w.T)
+        # 入力の勾配 (B*Oh*Ow,M)×(M,C*Fh*Fw)
+        grad_x = PrimitiveCol2im(C, Oh, Ow, Fh, Fw, Sh, Sw, Ih+2*pad, Iw+2*pad)(grad_cols)
+        # 順伝播で画像調整した分を戻す
+        grad_x = grad_x[:, :, pad:pad+Ih, pad:pad+Iw]
+
+        return grad_x
+
+class PrimitiveIm2col:
+    def __init__(self, C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow):
+        self.config = C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow
+
+    def __call__(self, img):
+        C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow = self.config
+        B = img.shape[0]
+        col = np.empty((B,Oh,Ow,C*Fh*Fw), dtype=Config.dtype)
+        for ih in range(0, Ih-Fh+1, Sh):     
+            for iw in range(0, Iw-Fw+1, Sw):
+                xij = img[:,:,ih:ih+Fh, iw:iw+Fw]
+                col[:,ih//Sh,iw//Sw,:] = xij.reshape(B, -1)
+        return col.reshape(B*Oh*Ow, C*Fh*Fw)           
+
+class PrimitiveCol2im:
+    def __init__(self, C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow):
+        self.config = C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow
+
+    def __call__(self, col):
+        C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow = self.config
+        B = col.shape[0] // (Ih*Iw)
+        img = np.zeros((B,C,Oh,Ow), dtype=Config.dtype)
+        col = col.reshape(B,Ih,Iw,C*Fh*Fw)
+        for ih in range(0, Oh-Fh+1, Sh):
+            for iw in range(0, Ow-Fw+1, Sw):
+                xij = col[:,ih//Sh,iw//Sw,:]
+                img[:,:,ih:ih+Fh, iw:iw+Fw] += xij.reshape(B,C,Fh,Fw)
+        return img        
+
+class Im2col:
+    """
+    入力画像とフィルタを行列に変換
+    img_pad.shape=(B,C,Ih+2*pad,Iw+2*pad) → cols.shape=(B,C,Fh,Fw,Oh,Ow)
+    img_padからstride毎のデータを取ってきて、colsにOh,Owになるまで並べる
+    それをFh,Fwを満たすまで繰返す
+    """
+    def __init__(self, C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow):
+        self.config = C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow
+
+    def __call__(self, img):
+        C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow = self.config
+        B = img.size // (C*Ih*Iw)
+        cols = np.empty((B, C, Fh, Fw, Oh, Ow), dtype=Config.dtype)  # メモリ節約のためzerosでなくempty 
+        for h in range(Fh):
+            h_lim = h + Sh*Oh
+            for w in range(Fw):
+                w_lim = w + Sw*Ow
+                cols[:, :, h, w, :, :] = img[:, :, h:h_lim:Sh, w:w_lim:Sw]
+        # 軸の入替と変形       B  Oh Ow C  Fh Fw
+        cols = cols.transpose(0, 4, 5, 1, 2, 3).reshape(B*Oh*Ow, C*Fh*Fw)
+        return cols
+
+class Col2im:
+    """
+    行列を入力画像に逆変換
+    cols.shape=(B,C,Fh,Fw,Oh,Ow) → img_pad.shape=(B,C,Ih+2*pad,Iw+2*pad) 
+    colsからstride*Oh,Ow個のデータを取ってきて、img_padにstride毎に並べる
+    それをFh,Fwを満たすまで繰返す
+    """
+    def __init__(self,  C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow):
+        self.config = C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow
+
+    def __call__(self, col):
+        C, Ih, Iw, Fh, Fw, Sh, Sw, Oh, Ow = self.config
+        B = col.size // (C*Ih*Iw*Fh*Fw)
+        col = col.reshape(B,Ih,Iw,C,Fh,Fw).transpose(0, 3, 4, 5, 1, 2)
+        img = np.zeros((B, C, Oh, Ow), dtype=Config.dtype)
+        for h in range(Fh):
+            h_lim = h + Sh*Ih
+            for w in range(Fw):
+                w_lim = w + Sw*Iw
+                img[:, :, h:h_lim:Sh, w:w_lim:Sw] += col[:, :, h, w, :, :]
+        return img
+
+
+class ConvLayerz(BaseLayer):
     """ 畳み込み層(img2col変換による高速版 numpyではあまり差がないがcupyで顕著) """
     # B:バッチサイズ, C:入力チャンネル数, Ih:入力画像高, Iw:入力画像幅
     # M:フィルタ数, Fh:フィルタ高, Fw:フィルタ幅
